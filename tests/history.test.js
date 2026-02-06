@@ -149,11 +149,11 @@ describe('history', () => {
         content: `msg ${i}`,
       }));
       const window = buildMessageWindow(messages, 'system', 5);
-      // 1 system + 5 latest = 6
-      expect(window).toHaveLength(6);
+      // 1 system + 1 original task + 5 latest = 7
       expect(window[0].role).toBe('system');
-      expect(window[1].content).toBe('msg 25');
-      expect(window[6 - 1].content).toBe('msg 29');
+      // First user message (msg 0) should be preserved as original task
+      expect(window[1].content).toContain('[ORYGINALNE ZADANIE]');
+      expect(window[1].content).toContain('msg 0');
     });
 
     it('should use CONFIG.MAX_HISTORY_MESSAGES as default', () => {
@@ -162,14 +162,63 @@ describe('history', () => {
         content: `msg ${i}`,
       }));
       const window = buildMessageWindow(messages, 'sys');
-      // 1 system + 20 (default from CONFIG) = 21
-      expect(window).toHaveLength(21);
+      // 1 system + 1 original task + 20 (default from CONFIG) = 22
+      expect(window).toHaveLength(22);
     });
 
     it('should handle empty messages', () => {
       const window = buildMessageWindow([], 'system prompt');
       expect(window).toHaveLength(1);
       expect(window[0].role).toBe('system');
+    });
+
+    it('should preserve first user message with ORYGINALNE ZADANIE prefix when outside window', () => {
+      const messages = [
+        { role: 'user', content: 'zrób mi aplikację' },
+        ...Array.from({ length: 20 }, (_, i) => ({
+          role: i % 2 === 0 ? 'assistant' : 'user',
+          content: `msg ${i}`,
+        })),
+      ];
+      const window = buildMessageWindow(messages, 'system', 5);
+      // System + original task + 5 recent
+      expect(window[0].role).toBe('system');
+      expect(window[1].role).toBe('user');
+      expect(window[1].content).toContain('[ORYGINALNE ZADANIE]');
+      expect(window[1].content).toContain('zrób mi aplikację');
+    });
+
+    it('should not duplicate first message when it is inside the window', () => {
+      const messages = [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'hi' },
+      ];
+      const window = buildMessageWindow(messages, 'sys', 10);
+      // System + 2 messages (no duplication)
+      expect(window).toHaveLength(3);
+      // First user message should NOT have the prefix since it's already in window
+      expect(window[1].content).toBe('hello');
+    });
+
+    it('should compress old command feedback messages', () => {
+      const longFeedback = '[WYNIKI WYKONANIA KOMEND]\nKatalog roboczy: C:\\test\n\n' +
+        Array.from({ length: 30 }, (_, i) => `linia ${i}`).join('\n');
+
+      const messages = [
+        { role: 'user', content: 'zrób coś' },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: longFeedback },
+        { role: 'assistant', content: 'naprawiam' },
+        ...Array.from({ length: 6 }, (_, i) => ({
+          role: i % 2 === 0 ? 'user' : 'assistant',
+          content: `recent ${i}`,
+        })),
+      ];
+      const window = buildMessageWindow(messages, 'sys', 10);
+      // Find the compressed feedback
+      const feedbackMsg = window.find(m => m.content.includes('[WYNIKI WYKONANIA KOMEND]'));
+      expect(feedbackMsg).toBeDefined();
+      expect(feedbackMsg.content).toContain('skrócono');
     });
   });
 

@@ -158,3 +158,173 @@ export function buildProjectContext(analysis) {
   ctx += '--- KONIEC KONTEKSTU ---\n';
   return ctx;
 }
+
+/**
+ * Szybkie skanowanie struktury projektu (bez zawartości plików).
+ * Używane do auto-kontekstu przy starcie.
+ *
+ * @param {string} targetPath - ścieżka do katalogu
+ * @param {number} [maxDepth=3] - maksymalna głębokość skanowania
+ * @returns {Promise<{rootPath: string, files: string[], dirs: string[], packageJson: object|null}>}
+ */
+export async function quickScanProject(targetPath, maxDepth = 3) {
+  const result = {
+    rootPath: targetPath,
+    files: [],
+    dirs: [],
+    packageJson: null,
+    gitIgnore: false,
+  };
+
+  await quickScanDir(targetPath, targetPath, result, 0, maxDepth);
+
+  // Próbuj załadować package.json dla kontekstu
+  try {
+    const pkgPath = join(targetPath, 'package.json');
+    const pkgContent = await readFile(pkgPath, 'utf-8');
+    const pkg = JSON.parse(pkgContent);
+    result.packageJson = {
+      name: pkg.name,
+      version: pkg.version,
+      description: pkg.description,
+      main: pkg.main,
+      scripts: pkg.scripts ? Object.keys(pkg.scripts) : [],
+      dependencies: pkg.dependencies ? Object.keys(pkg.dependencies) : [],
+      devDependencies: pkg.devDependencies ? Object.keys(pkg.devDependencies) : [],
+    };
+  } catch {
+    // Brak package.json - to OK
+  }
+
+  // Sprawdź czy jest .gitignore
+  try {
+    await stat(join(targetPath, '.gitignore'));
+    result.gitIgnore = true;
+  } catch {
+    // Brak .gitignore
+  }
+
+  // Załaduj kluczowe pliki (README, entry point)
+  try {
+    result.keyFiles = await loadKeyFiles(targetPath, result.files, result.packageJson);
+  } catch {
+    result.keyFiles = {};
+  }
+
+  return result;
+}
+
+async function quickScanDir(dir, rootPath, result, depth, maxDepth) {
+  if (depth > maxDepth) return;
+  if (result.files.length > 200) return; // Limit bezpieczeństwa
+
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (result.files.length > 200) break;
+
+    const fullPath = join(dir, entry.name);
+    const relPath = relative(rootPath, fullPath);
+
+    if (entry.isDirectory()) {
+      if (CONFIG.ANALYZER_EXCLUDED_DIRS.includes(entry.name)) continue;
+      if (entry.name.startsWith('.') && entry.name !== '.github') continue;
+
+      result.dirs.push(relPath);
+      await quickScanDir(fullPath, rootPath, result, depth + 1, maxDepth);
+    } else if (entry.isFile()) {
+      const ext = extname(entry.name).toLowerCase();
+      // Tylko pliki z rozpoznawalnymi rozszerzeniami lub kluczowe pliki
+      if (CONFIG.ANALYZER_EXTENSIONS.includes(ext) ||
+          ['package.json', 'tsconfig.json', 'README.md', '.env.example', 'Dockerfile', 'Makefile'].includes(entry.name)) {
+        result.files.push(relPath);
+      }
+    }
+  }
+}
+
+/**
+ * Ładuje treść kluczowych plików projektu (README.md, entry point).
+ * Zwraca obiekt { nazwa: treść (obcięta do maxLines) }.
+ *
+ * @param {string} rootPath - ścieżka do katalogu projektu
+ * @param {string[]} fileList - lista plików ze skanu
+ * @param {object|null} packageJson - dane z package.json
+ * @returns {Promise<Object<string, string>>}
+ */
+export async function loadKeyFiles(rootPath, fileList, packageJson) {
+  const maxLines = CONFIG.ANALYZER_KEY_FILE_MAX_LINES || 60;
+  const keyFiles = {};
+
+  // README.md — pierwsze 60 linii
+  const readmeName = fileList.find(f => f.toLowerCase() === 'readme.md');
+  if (readmeName) {
+    try {
+      const content = await readFile(join(rootPath, readmeName), 'utf-8');
+      const lines = content.split('\n').slice(0, maxLines);
+      keyFiles[readmeName] = lines.join('\n');
+    } catch {
+      // pomiń — plik niedostępny
+    }
+  }
+
+  // Main entry point z package.json — pierwsze 40 linii
+  const entryFile = packageJson?.main;
+  if (entryFile && fileList.includes(entryFile)) {
+    try {
+      const content = await readFile(join(rootPath, entryFile), 'utf-8');
+      const lines = content.split('\n').slice(0, 40);
+      keyFiles[entryFile] = lines.join('\n');
+    } catch {
+      // pomiń
+    }
+  }
+
+  return keyFiles;
+}
+
+/**
+ * Buduje zwięzły kontekst struktury projektu (bez zawartości).
+ */
+export function buildQuickContext(scan) {
+  if (!scan) return '';
+
+  let ctx = `\n\n--- STRUKTURA PROJEKTU (${scan.rootPath}) ---\n`;
+
+  if (scan.packageJson) {
+    ctx += `\n📦 Projekt: ${scan.packageJson.name || 'nieznany'} v${scan.packageJson.version || '?'}\n`;
+    if (scan.packageJson.description) {
+      ctx += `   ${scan.packageJson.description}\n`;
+    }
+    if (scan.packageJson.main) {
+      ctx += `   Entry: ${scan.packageJson.main}\n`;
+    }
+    if (scan.packageJson.scripts.length > 0) {
+      ctx += `   Skrypty: ${scan.packageJson.scripts.join(', ')}\n`;
+    }
+    if (scan.packageJson.dependencies.length > 0) {
+      ctx += `   Deps: ${scan.packageJson.dependencies.slice(0, 10).join(', ')}${scan.packageJson.dependencies.length > 10 ? '...' : ''}\n`;
+    }
+  }
+
+  ctx += `\n📁 Pliki (${scan.files.length}):\n`;
+  ctx += buildFileTree(scan.files);
+
+  // Kluczowe pliki — treść
+  if (scan.keyFiles && Object.keys(scan.keyFiles).length > 0) {
+    ctx += '\n\n--- KLUCZOWE PLIKI ---\n';
+    for (const [name, content] of Object.entries(scan.keyFiles)) {
+      ctx += `\n### ${name}\n${content}\n`;
+    }
+  }
+
+  ctx += '\n\n💡 Użyj @plik.js aby załadować zawartość konkretnego pliku.\n';
+  ctx += '--- KONIEC STRUKTURY ---\n';
+
+  return ctx;
+}

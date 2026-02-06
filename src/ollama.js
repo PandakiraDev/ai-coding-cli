@@ -3,6 +3,7 @@
 import axios from 'axios';
 import { CONFIG, OLLAMA_URL } from './config.js';
 import { getContextualDemoResponse } from './demo-responses.js';
+import { logger } from './logger.js';
 
 /**
  * Streaming z prawdziwego Ollama /api/chat.
@@ -12,20 +13,42 @@ import { getContextualDemoResponse } from './demo-responses.js';
  * @param {(token:string)=>void} onToken - callback na każdy fragment tekstu
  * @param {(fullText:string)=>void} onComplete - callback po zakończeniu
  * @param {(error:Error)=>void} onError - callback na błąd
+ * @param {AbortSignal} [abortSignal] - sygnał do przerwania
  */
-export async function streamOllama(messages, onToken, onComplete, onError) {
+export async function streamOllama(messages, onToken, onComplete, onError, abortSignal) {
   let fullText = '';
   let completed = false;
   let buffer = '';
 
   let finalStats = null;
+  const startTime = Date.now();
 
-  const finish = () => {
+  logger.info('OLLAMA', `Wysyłam request do ${OLLAMA_URL}`);
+  logger.debug('OLLAMA', `Model: ${CONFIG.MODEL_NAME}, Wiadomości: ${messages.length}`);
+  logger.trace('OLLAMA', 'Payload:', messages.slice(-2)); // Ostatnie 2 wiadomości
+
+  const finish = (aborted = false) => {
     if (!completed) {
       completed = true;
+      const duration = Date.now() - startTime;
+      if (aborted) {
+        finalStats = { ...finalStats, aborted: true };
+        logger.warn('OLLAMA', `Przerwano po ${duration}ms, otrzymano ${fullText.length} znaków`);
+      } else {
+        logger.info('OLLAMA', `Zakończono po ${duration}ms, ${fullText.length} znaków`);
+        logger.debug('OLLAMA', 'Stats:', finalStats);
+      }
       onComplete(fullText, finalStats);
     }
   };
+
+  // Obsługa przerwania
+  if (abortSignal) {
+    abortSignal.addEventListener('abort', () => {
+      logger.debug('OLLAMA', 'Otrzymano sygnał abort');
+      finish(true);
+    });
+  }
 
   try {
     const response = await axios.post(
@@ -39,8 +62,11 @@ export async function streamOllama(messages, onToken, onComplete, onError) {
         timeout: CONFIG.REQUEST_TIMEOUT,
         responseType: 'stream',
         headers: { 'Content-Type': 'application/json' },
+        signal: abortSignal,
       }
     );
+
+    logger.debug('OLLAMA', 'Połączenie nawiązane, streaming...');
 
     response.data.on('data', (chunk) => {
       buffer += chunk.toString();
@@ -92,12 +118,14 @@ export async function streamOllama(messages, onToken, onComplete, onError) {
     response.data.on('error', (err) => {
       if (!completed) {
         completed = true;
+        logger.error('OLLAMA', `Błąd streamu: ${err.message}`);
         onError(err);
       }
     });
   } catch (err) {
     if (!completed) {
       completed = true;
+      logger.error('OLLAMA', `Błąd połączenia: ${err.message}`, err.code);
       onError(err);
     }
   }
@@ -112,18 +140,28 @@ export async function streamOllama(messages, onToken, onComplete, onError) {
  * @param {string} userInput - ostatni input użytkownika
  * @param {(token:string)=>void} onToken
  * @param {(fullText:string)=>void} onComplete
- * @param {{ messages?: Array<{role:string,content:string}>, hasProjectContext?: boolean }} [opts]
+ * @param {{ messages?: Array<{role:string,content:string}>, hasProjectContext?: boolean, abortSignal?: AbortSignal }} [opts]
  */
 export async function streamDemo(userInput, onToken, onComplete, opts = {}) {
-  const { messages = [], hasProjectContext = false } = opts;
+  const { messages = [], hasProjectContext = false, abortSignal } = opts;
   const text = getContextualDemoResponse(userInput, messages, hasProjectContext);
 
   // Dzielimy na tokeny: słowa + whitespace/interpunkcja (zachowujemy formatowanie)
   const tokens = text.match(/\S+|\s+/g) || [text];
   let idx = 0;
+  let aborted = false;
 
   return new Promise((resolve) => {
     const timer = setInterval(() => {
+      // Sprawdź czy przerwano
+      if (abortSignal?.aborted || aborted) {
+        clearInterval(timer);
+        const partialText = tokens.slice(0, idx).join('');
+        onComplete(partialText, { estimatedTokens: Math.ceil(partialText.length / 4), aborted: true });
+        resolve();
+        return;
+      }
+
       if (idx >= tokens.length) {
         clearInterval(timer);
         const estimatedTokens = Math.ceil(text.length / 4);
@@ -137,6 +175,13 @@ export async function streamDemo(userInput, onToken, onComplete, opts = {}) {
       idx += count;
       onToken(chunk);
     }, CONFIG.DEMO_STREAM_CHAR_DELAY);
+
+    // Listener dla przerwania
+    if (abortSignal) {
+      abortSignal.addEventListener('abort', () => {
+        aborted = true;
+      });
+    }
   });
 }
 
@@ -145,15 +190,20 @@ export async function streamDemo(userInput, onToken, onComplete, opts = {}) {
  * @returns {Promise<boolean>}
  */
 export async function checkConnection() {
-  if (CONFIG.DEMO_MODE) return true;
+  if (CONFIG.DEMO_MODE) {
+    logger.debug('OLLAMA', 'Tryb demo - pomijam sprawdzenie połączenia');
+    return true;
+  }
+
+  const url = `http://${CONFIG.OLLAMA_HOST}:${CONFIG.OLLAMA_PORT}/api/tags`;
+  logger.debug('OLLAMA', `Sprawdzam połączenie: ${url}`);
 
   try {
-    await axios.get(
-      `http://${CONFIG.OLLAMA_HOST}:${CONFIG.OLLAMA_PORT}/api/tags`,
-      { timeout: 5000 }
-    );
+    await axios.get(url, { timeout: 5000 });
+    logger.info('OLLAMA', 'Połączenie OK');
     return true;
-  } catch {
+  } catch (err) {
+    logger.warn('OLLAMA', `Brak połączenia: ${err.message}`);
     return false;
   }
 }

@@ -110,10 +110,10 @@ describe('commands', () => {
 
       expect(result.action).toBe('continue');
 
-      // Should list available commands including /autorun
+      // Should suggest using /help
       const calls = consoleSpy.mock.calls.map(c => c[0]);
-      const hasAutorun = calls.some(c => typeof c === 'string' && c.includes('/autorun'));
-      expect(hasAutorun).toBe(true);
+      const hasHelpSuggestion = calls.some(c => typeof c === 'string' && c.includes('/help'));
+      expect(hasHelpSuggestion).toBe(true);
 
       consoleSpy.mockRestore();
     });

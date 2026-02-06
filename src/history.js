@@ -101,8 +101,31 @@ export async function listConversations() {
 }
 
 /**
+ * Kompresuje stary feedback komend — zachowuje nagłówek + 5 ostatnich linii.
+ * @param {string} content
+ * @returns {string}
+ */
+function compressFeedbackMessage(content) {
+  if (!content.includes('[WYNIKI WYKONANIA KOMEND]')) return content;
+
+  const lines = content.split('\n');
+  if (lines.length <= 10) return content;
+
+  // Nagłówek: pierwsze 3 linie (tytuł, cwd, pusta)
+  const header = lines.slice(0, 3);
+  // Ostatnie 5 linii
+  const tail = lines.slice(-5);
+  const omitted = lines.length - header.length - tail.length;
+
+  return [...header, `... (skrócono ${omitted} linii) ...`, ...tail].join('\n');
+}
+
+/**
  * Buduje okno wiadomości dla API /api/chat.
- * Zawsze system prompt na początku, potem ostatnie maxN wiadomości.
+ * - Zawsze system prompt na początku
+ * - Zawsze zachowuje pierwszą wiadomość użytkownika z prefixem [ORYGINALNE ZADANIE]
+ * - Kompresuje stare feedbacki komend
+ * - Potem ostatnie maxN wiadomości
  *
  * @param {Array<{role: string, content: string}>} messages
  * @param {string} systemPrompt
@@ -111,11 +134,39 @@ export async function listConversations() {
  */
 export function buildMessageWindow(messages, systemPrompt, maxN) {
   const max = maxN ?? CONFIG.MAX_HISTORY_MESSAGES;
-  const window = messages.slice(-max);
-  return [
-    { role: 'system', content: systemPrompt },
-    ...window,
-  ];
+
+  // Znajdź pierwszą wiadomość użytkownika (oryginalne zadanie)
+  const firstUserIdx = messages.findIndex(m => m.role === 'user');
+
+  // Weź ostatnie max wiadomości
+  const recentWindow = messages.slice(-max);
+
+  // Sprawdź czy pierwsza wiadomość użytkownika jest już w oknie
+  const firstUserInWindow = firstUserIdx >= 0 && firstUserIdx >= messages.length - max;
+
+  const result = [{ role: 'system', content: systemPrompt }];
+
+  // Dodaj pierwszą wiadomość użytkownika z prefixem jeśli nie ma jej w oknie
+  if (firstUserIdx >= 0 && !firstUserInWindow) {
+    const original = messages[firstUserIdx];
+    result.push({
+      role: 'user',
+      content: `[ORYGINALNE ZADANIE] ${original.content}`,
+    });
+  }
+
+  // Dodaj wiadomości z okna, kompresując stare feedbacki
+  for (const msg of recentWindow) {
+    // Kompresuj feedbacki komend (oprócz ostatnich 4 wiadomości)
+    const isRecent = messages.indexOf(msg) >= messages.length - 4;
+    if (msg.role === 'user' && !isRecent && msg.content.includes('[WYNIKI WYKONANIA KOMEND]')) {
+      result.push({ ...msg, content: compressFeedbackMessage(msg.content) });
+    } else {
+      result.push(msg);
+    }
+  }
+
+  return result;
 }
 
 // --- Auto-save ---

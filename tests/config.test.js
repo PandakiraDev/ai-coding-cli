@@ -35,7 +35,7 @@ describe('CONFIG', () => {
   });
 
   it('should have sensible default values', () => {
-    expect(CONFIG.OLLAMA_PORT).toBe(11434);
+    expect(CONFIG.OLLAMA_PORT).toBe(56541);
     expect(CONFIG.MAX_HISTORY_MESSAGES).toBe(20);
     expect(CONFIG.MAX_INPUT_LENGTH).toBe(10000);
     expect(CONFIG.WARN_INPUT_LENGTH).toBe(5000);

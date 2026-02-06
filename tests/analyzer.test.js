@@ -10,7 +10,7 @@ vi.mock('fs/promises', () => ({
 }));
 
 import { readdir, readFile, stat } from 'fs/promises';
-import { analyzeProject, buildFileTree, buildProjectContext } from '../src/analyzer.js';
+import { analyzeProject, buildFileTree, buildProjectContext, loadKeyFiles, buildQuickContext } from '../src/analyzer.js';
 
 describe('analyzer', () => {
   beforeEach(() => {
@@ -162,6 +162,107 @@ describe('analyzer', () => {
 
       expect(result.files).toHaveLength(0);
       expect(result.skipped.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('loadKeyFiles', () => {
+    it('should load README.md content', async () => {
+      const readmeContent = Array.from({ length: 100 }, (_, i) => `Line ${i}`).join('\n');
+      readFile.mockResolvedValueOnce(readmeContent);
+
+      const result = await loadKeyFiles('/project', ['README.md', 'src/index.js'], null);
+
+      expect(result['README.md']).toBeDefined();
+      // Should be truncated to 60 lines
+      const lines = result['README.md'].split('\n');
+      expect(lines.length).toBe(60);
+      expect(lines[0]).toBe('Line 0');
+    });
+
+    it('should load entry point from package.json main', async () => {
+      const entryContent = Array.from({ length: 50 }, (_, i) => `code ${i}`).join('\n');
+      readFile.mockResolvedValueOnce(entryContent);
+
+      const result = await loadKeyFiles('/project', ['src/index.js'], { main: 'src/index.js' });
+
+      expect(result['src/index.js']).toBeDefined();
+      // Should be truncated to 40 lines
+      const lines = result['src/index.js'].split('\n');
+      expect(lines.length).toBe(40);
+    });
+
+    it('should return empty object when no key files found', async () => {
+      const result = await loadKeyFiles('/project', ['app.js', 'util.js'], null);
+      expect(Object.keys(result)).toHaveLength(0);
+    });
+
+    it('should handle read errors gracefully', async () => {
+      readFile.mockRejectedValueOnce(new Error('EACCES'));
+
+      const result = await loadKeyFiles('/project', ['README.md'], null);
+      expect(Object.keys(result)).toHaveLength(0);
+    });
+
+    it('should find readme case-insensitively', async () => {
+      readFile.mockResolvedValueOnce('# My Project');
+
+      const result = await loadKeyFiles('/project', ['readme.md'], null);
+      expect(result['readme.md']).toBe('# My Project');
+    });
+  });
+
+  describe('buildQuickContext', () => {
+    it('should return empty string for null scan', () => {
+      expect(buildQuickContext(null)).toBe('');
+    });
+
+    it('should include key files section when keyFiles present', () => {
+      const scan = {
+        rootPath: '/project',
+        files: ['index.js'],
+        dirs: [],
+        packageJson: null,
+        keyFiles: { 'README.md': '# Test Project' },
+      };
+      const ctx = buildQuickContext(scan);
+      expect(ctx).toContain('KLUCZOWE PLIKI');
+      expect(ctx).toContain('README.md');
+      expect(ctx).toContain('# Test Project');
+    });
+
+    it('should not include key files section when empty', () => {
+      const scan = {
+        rootPath: '/project',
+        files: ['index.js'],
+        dirs: [],
+        packageJson: null,
+        keyFiles: {},
+      };
+      const ctx = buildQuickContext(scan);
+      expect(ctx).not.toContain('KLUCZOWE PLIKI');
+    });
+
+    it('should include package.json info', () => {
+      const scan = {
+        rootPath: '/project',
+        files: ['index.js'],
+        dirs: [],
+        packageJson: {
+          name: 'test-app',
+          version: '1.0.0',
+          description: 'A test app',
+          main: 'index.js',
+          scripts: ['start', 'test'],
+          dependencies: ['express'],
+          devDependencies: [],
+        },
+        keyFiles: {},
+      };
+      const ctx = buildQuickContext(scan);
+      expect(ctx).toContain('test-app');
+      expect(ctx).toContain('1.0.0');
+      expect(ctx).toContain('Entry: index.js');
+      expect(ctx).toContain('start, test');
     });
   });
 });
