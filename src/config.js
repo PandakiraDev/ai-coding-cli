@@ -14,7 +14,8 @@ export const CONFIG = {
   // --- Ollama ---
   OLLAMA_HOST: '62.3.175.157',
   OLLAMA_PORT: 56541,
-  MODEL_NAME: 'qwen2.5-coder:32b',
+  // MODEL_NAME: 'qwen2.5-coder:32b',
+  MODEL_NAME: 'qwen3-coder-next',
   REQUEST_TIMEOUT: 300000,
 
   // --- Historia / sliding window ---

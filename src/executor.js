@@ -448,7 +448,15 @@ export function formatResultsForFeedback(results) {
   const executed = results.filter(r => !r.skipped);
   if (executed.length === 0) return null;
 
-  let feedback = `\n[WYNIKI WYKONANIA KOMEND]\nKatalog roboczy: ${currentWorkingDir}\n`;
+  const hasErrors = executed.some(r => !r.success);
+
+  // Silny sygnał STOP na początku przy błędach
+  let feedback = '';
+  if (hasErrors) {
+    feedback += `\n⛔ STOP — BŁĄD W KOMENDZIE. PRZERWIJ AKTUALNY PLAN.\nSkoncentruj się WYŁĄCZNIE na naprawie tego błędu. NIE kontynuuj planu dopóki błąd nie zostanie naprawiony.\n`;
+  }
+
+  feedback += `\n[WYNIKI WYKONANIA KOMEND]\nKatalog roboczy: ${currentWorkingDir}\n`;
 
   for (const r of executed) {
     feedback += `\n--- Komenda: ${r.command} ---\n`;
@@ -478,7 +486,7 @@ export function formatResultsForFeedback(results) {
       }
 
       feedback += `\nDiagnostyka: ${hint}\n`;
-      feedback += `INSTRUKCJA: 1) Zbadaj kontekst (Get-Location, Test-Path, Get-ChildItem) 2) Napraw przyczynę, nie symptom 3) NIE powtarzaj tej samej komendy\n`;
+      feedback += `WYMAGANE DZIAŁANIE: 1) Zbadaj kontekst (Get-Location, Test-Path, Get-ChildItem) 2) Napraw PRZYCZYNĘ, nie symptom 3) NIE powtarzaj tej samej komendy — zmień podejście\n`;
     }
   }
 

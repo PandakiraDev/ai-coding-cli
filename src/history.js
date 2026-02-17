@@ -156,10 +156,14 @@ export function buildMessageWindow(messages, systemPrompt, maxN) {
   }
 
   // Dodaj wiadomości z okna, kompresując stare feedbacki
-  for (const msg of recentWindow) {
+  const windowStartIdx = messages.length - recentWindow.length;
+  const recentThreshold = messages.length - 4;
+
+  for (let i = 0; i < recentWindow.length; i++) {
+    const msg = recentWindow[i];
+    const globalIdx = windowStartIdx + i;
     // Kompresuj feedbacki komend (oprócz ostatnich 4 wiadomości)
-    const isRecent = messages.indexOf(msg) >= messages.length - 4;
-    if (msg.role === 'user' && !isRecent && msg.content.includes('[WYNIKI WYKONANIA KOMEND]')) {
+    if (msg.role === 'user' && globalIdx < recentThreshold && msg.content.includes('[WYNIKI WYKONANIA KOMEND]')) {
       result.push({ ...msg, content: compressFeedbackMessage(msg.content) });
     } else {
       result.push(msg);

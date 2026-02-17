@@ -14,7 +14,7 @@ import {
   stopAutoSave,
 } from './history.js';
 import { streamOllama, streamDemo } from './ollama.js';
-import { handlePowerShellCommands, formatResultsForFeedback, isFileModifyingCommand } from './executor.js';
+import { handlePowerShellCommands, formatResultsForFeedback, isFileModifyingCommand, getWorkingDir } from './executor.js';
 import { isCommand, handleCommand } from './commands.js';
 import { readInput, loadCommandHistory, saveCommandHistory } from './input.js';
 import { StreamStats } from './stats.js';
@@ -48,6 +48,8 @@ marked.use(markedTerminal({
 
 // Maksymalna liczba automatycznych prób naprawy błędów
 const MAX_AUTO_RETRY = 3;
+// Maksymalna liczba automatycznych kontynuacji po sukcesie (kroków planu)
+const MAX_AUTO_CONTINUE = 10;
 
 /**
  * Ustawia nasłuchiwanie na Ctrl+C do przerwania generowania.
@@ -179,7 +181,131 @@ async function getAIResponse(state, apiMessages) {
 }
 
 /**
+ * Buduje system prompt z wszystkimi kontekstami.
+ * @param {Object} state
+ * @returns {string}
+ */
+function buildSystemPrompt(state) {
+  let systemPrompt = CONFIG.SYSTEM_PROMPT;
+
+  if (state.quickContext) {
+    systemPrompt += state.quickContext;
+  }
+  if (state.projectContext) {
+    systemPrompt += state.projectContext;
+  }
+  if (state.memoryContext) {
+    systemPrompt += state.memoryContext;
+  }
+
+  return systemPrompt;
+}
+
+/**
+ * Odświeża kontekst projektu po komendach modyfikujących pliki.
+ * Używa katalogu roboczego z executora (śledzi cd).
+ * @param {Object} state
+ * @param {Array} cmdResults
+ */
+async function refreshContextIfNeeded(state, cmdResults) {
+  const fileModified = cmdResults.some(r => !r.skipped && r.success && isFileModifyingCommand(r.command));
+  if (!fileModified) return;
+
+  try {
+    const cwd = getWorkingDir();
+    const freshScan = await quickScanProject(cwd, 3);
+    state.quickContext = buildQuickContext(freshScan);
+    logger.info('CHAT', `Odświeżono kontekst projektu (${cwd})`);
+  } catch (err) {
+    logger.warn('CHAT', `Nie udało się odświeżyć kontekstu: ${err.message}`);
+  }
+}
+
+/**
+ * Wysyła jedną wiadomość do modelu i przetwarza odpowiedź.
+ * Zwraca obiekt z wynikiem jednej iteracji.
+ *
+ * @param {Object} state
+ * @returns {Promise<{done: boolean, ok: boolean, hasCommands: boolean, hasErrors: boolean, feedback: string|null}>}
+ */
+async function runOneAIIteration(state) {
+  const { conversation } = state;
+
+  const systemPrompt = buildSystemPrompt(state);
+  const apiMessages = buildMessageWindow(
+    conversation.messages.map(m => ({ role: m.role, content: m.content })),
+    systemPrompt,
+  );
+
+  logger.debug('CHAT', `Wysyłam ${apiMessages.length} wiadomości do API`);
+
+  const { response, error, aborted } = await getAIResponse(state, apiMessages);
+
+  if (error) {
+    logger.error('CHAT', `Błąd komunikacji: ${error.message}`);
+    if (conversation.messages.length > 0 &&
+        conversation.messages[conversation.messages.length - 1].role === 'user') {
+      conversation.messages.pop();
+    }
+    return { done: true, ok: false, hasCommands: false, hasErrors: false, feedback: null };
+  }
+
+  if (aborted) {
+    logger.info('CHAT', 'Generowanie przerwane przez użytkownika');
+    if (response) {
+      conversation.messages.push({
+        role: 'assistant',
+        content: response + '\n\n[przerwano przez użytkownika]',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    return { done: true, ok: true, hasCommands: false, hasErrors: false, feedback: null };
+  }
+
+  if (!response) {
+    return { done: false, ok: true, hasCommands: false, hasErrors: false, feedback: null };
+  }
+
+  // Dodaj odpowiedź do historii
+  conversation.messages.push({
+    role: 'assistant',
+    content: response,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Wyświetl diffy
+  const codeBlocks = extractCodeBlocks(response);
+  const diffCount = processAndDisplayDiffs(response, codeBlocks);
+  if (diffCount > 0) {
+    console.log(chalk.gray(`📊 Wyświetlono ${diffCount} zmian w plikach\n`));
+  }
+
+  // Obsłuż komendy PowerShell
+  const cmdResults = await handlePowerShellCommands(response, state.autoExecute);
+  const feedback = formatResultsForFeedback(cmdResults);
+
+  const executedCount = cmdResults.filter(r => !r.skipped).length;
+  const hasErrors = cmdResults.some(r => !r.skipped && !r.success);
+
+  // Odśwież kontekst po modyfikacjach plików
+  await refreshContextIfNeeded(state, cmdResults);
+
+  return {
+    done: false,
+    ok: true,
+    hasCommands: executedCount > 0,
+    hasErrors,
+    feedback,
+  };
+}
+
+/**
  * Przetwarza turę AI: wysyła zapytanie, wykonuje komendy, obsługuje błędy.
+ *
+ * Dwie pętle:
+ * - Kontynuacja (po sukcesie z komendami) — max MAX_AUTO_CONTINUE kroków
+ * - Retry (po błędzie) — max MAX_AUTO_RETRY prób naprawy
+ *
  * @param {Object} state - Stan konwersacji
  * @returns {Promise<boolean>} - true jeśli sukces, false jeśli błąd komunikacji
  */
@@ -188,134 +314,74 @@ async function processAITurn(state) {
 
   logger.info('CHAT', 'Rozpoczynam turę AI');
   logger.debug('CHAT', `Wiadomości w konwersacji: ${conversation.messages.length}`);
-  logger.state('CHAT', { autoExecute: state.autoExecute, hasProjectContext: !!state.projectContext });
 
-  for (let attempt = 0; attempt <= MAX_AUTO_RETRY; attempt++) {
-    logger.debug('CHAT', `Próba ${attempt + 1}/${MAX_AUTO_RETRY + 1}`);
+  let retryCount = 0;
+  let continueCount = 0;
 
-    // Buduj system prompt (opcjonalnie z kontekstem projektu)
-    let systemPrompt = CONFIG.SYSTEM_PROMPT;
+  while (true) {
+    logger.debug('CHAT', `Iteracja (kontynuacje: ${continueCount}, retry: ${retryCount})`);
 
-    // Dodaj szybki kontekst struktury (zawsze jeśli dostępny)
-    if (state.quickContext) {
-      systemPrompt += state.quickContext;
-      logger.trace('CHAT', 'Dodano szybki kontekst struktury do prompta');
+    const result = await runOneAIIteration(state);
+
+    // Błąd komunikacji lub przerwanie — koniec
+    if (result.done) {
+      return result.ok;
     }
 
-    // Dodaj pełny kontekst projektu (jeśli użyto /analyze)
-    if (state.projectContext) {
-      systemPrompt += state.projectContext;
-      logger.trace('CHAT', 'Dodano pełny kontekst projektu do prompta');
+    // Brak odpowiedzi (np. pusty response) — powtórz
+    if (!result.ok) continue;
+
+    // Brak komend = odpowiedź konwersacyjna — koniec tury
+    if (!result.hasCommands) {
+      return true;
     }
 
-    // Dodaj kontekst pamięci
-    if (state.memoryContext) {
-      systemPrompt += state.memoryContext;
-      logger.trace('CHAT', 'Dodano kontekst pamięci do prompta');
-    }
+    // Komendy bez błędów — kontynuacja planu
+    if (!result.hasErrors) {
+      continueCount++;
 
-    // Buduj okno wiadomości dla API
-    const apiMessages = buildMessageWindow(
-      conversation.messages.map(m => ({ role: m.role, content: m.content })),
-      systemPrompt,
-    );
-
-    logger.debug('CHAT', `Wysyłam ${apiMessages.length} wiadomości do API`);
-    logger.trace('CHAT', 'Ostatnia wiadomość:', apiMessages[apiMessages.length - 1]?.content?.slice(0, 100));
-
-    // Pobierz odpowiedź AI
-    const { response, error, aborted } = await getAIResponse(state, apiMessages);
-
-    if (error) {
-      logger.error('CHAT', `Błąd komunikacji: ${error.message}`);
-      // Usuń ostatnią wiadomość użytkownika z historii przy błędzie komunikacji
-      if (conversation.messages.length > 0 &&
-          conversation.messages[conversation.messages.length - 1].role === 'user') {
-        conversation.messages.pop();
-        logger.debug('CHAT', 'Usunięto ostatnią wiadomość użytkownika');
+      if (continueCount >= MAX_AUTO_CONTINUE) {
+        logger.info('CHAT', `Osiągnięto limit kontynuacji (${MAX_AUTO_CONTINUE})`);
+        console.log(chalk.yellow(`\n⏸ Wykonano ${MAX_AUTO_CONTINUE} kroków automatycznie. Kontynuować?\n`));
+        return true;
       }
-      return false;
-    }
 
-    // Jeśli przerwano - zapisz częściową odpowiedź i zakończ
-    if (aborted) {
-      logger.info('CHAT', 'Generowanie przerwane przez użytkownika');
-      if (response) {
+      if (result.feedback) {
+        // Odesłij wyniki komend do modelu — niech kontynuuje plan
         conversation.messages.push({
-          role: 'assistant',
-          content: response + '\n\n[przerwano przez użytkownika]',
+          role: 'user',
+          content: result.feedback,
           timestamp: new Date().toISOString(),
         });
-        logger.debug('CHAT', `Zapisano częściową odpowiedź (${response.length} znaków)`);
+        logger.info('CHAT', `Kontynuacja planu (krok ${continueCount}/${MAX_AUTO_CONTINUE})`);
+        console.log(chalk.cyan(`\n▶ Kontynuacja planu (krok ${continueCount})...\n`));
+      } else {
+        // Komendy wykonane ale brak feedbacku (np. pominięte) — koniec
+        return true;
       }
+
+      continue;
+    }
+
+    // Komendy z błędem — retry
+    retryCount++;
+
+    if (retryCount > MAX_AUTO_RETRY) {
+      logger.error('CHAT', `Osiągnięto limit prób naprawy (${MAX_AUTO_RETRY})`);
+      console.log(chalk.red(`\n⚠ Osiągnięto limit automatycznych prób naprawy (${MAX_AUTO_RETRY}). Proszę o manualną interwencję.\n`));
       return true;
     }
 
-    if (!response) continue;
+    logger.warn('CHAT', `Błąd w komendzie — naprawa ${retryCount}/${MAX_AUTO_RETRY}`);
+    console.log(chalk.yellow(`\n🔄 Błąd w komendzie — próba naprawy (${retryCount}/${MAX_AUTO_RETRY})...\n`));
 
-    // Dodaj odpowiedź do historii
+    // Odesłij diagnostykę błędu do modelu
     conversation.messages.push({
-      role: 'assistant',
-      content: response,
+      role: 'user',
+      content: result.feedback,
       timestamp: new Date().toISOString(),
     });
-
-    // Wyświetl diffy jeśli są w odpowiedzi
-    const codeBlocks = extractCodeBlocks(response);
-    const diffCount = processAndDisplayDiffs(response, codeBlocks);
-    if (diffCount > 0) {
-      console.log(chalk.gray(`📊 Wyświetlono ${diffCount} zmian w plikach\n`));
-    }
-
-    // Obsłuż komendy PowerShell
-    const cmdResults = await handlePowerShellCommands(response, state.autoExecute);
-    const feedback = formatResultsForFeedback(cmdResults);
-
-    // Odśwież kontekst projektu po komendach modyfikujących pliki
-    const fileModified = cmdResults.some(r => !r.skipped && r.success && isFileModifyingCommand(r.command));
-    if (fileModified) {
-      try {
-        const cwd = process.cwd();
-        const freshScan = await quickScanProject(cwd, 3);
-        state.quickContext = buildQuickContext(freshScan);
-        logger.info('CHAT', 'Odświeżono kontekst projektu po modyfikacji plików');
-      } catch (err) {
-        logger.warn('CHAT', `Nie udało się odświeżyć kontekstu: ${err.message}`);
-      }
-    }
-
-    // Sprawdź czy były błędy
-    const hasErrors = cmdResults.some(r => !r.skipped && !r.success);
-
-    if (!hasErrors) {
-      // Sukces! Możemy zakończyć
-      return true;
-    }
-
-    // Były błędy - sprawdź czy możemy ponowić
-    if (attempt < MAX_AUTO_RETRY) {
-      logger.warn('CHAT', `Błędy w komendach - próba naprawy ${attempt + 1}/${MAX_AUTO_RETRY}`);
-      console.log(chalk.yellow(`\n🔄 Wykryto błędy w komendach - próba naprawy (${attempt + 1}/${MAX_AUTO_RETRY})...\n`));
-
-      // Dodaj feedback jako wiadomość użytkownika
-      conversation.messages.push({
-        role: 'user',
-        content: feedback,
-        timestamp: new Date().toISOString(),
-      });
-
-      logger.trace('CHAT', 'Feedback dla modelu:', feedback?.slice(0, 200));
-
-      // Kontynuuj pętlę - model spróbuje naprawić
-    } else {
-      logger.error('CHAT', `Osiągnięto limit prób (${MAX_AUTO_RETRY})`);
-      console.log(chalk.red(`⚠ Osiągnięto limit automatycznych prób (${MAX_AUTO_RETRY}). Proszę o manualną interwencję.\n`));
-      return true; // Zwróć true żeby nie usuwać wiadomości
-    }
   }
-
-  logger.info('CHAT', 'Tura AI zakończona pomyślnie');
-  return true;
 }
 
 /**
@@ -353,7 +419,7 @@ export async function startChat() {
   // Auto-skanowanie struktury projektu
   try {
     logger.debug('CHAT', 'Auto-skanowanie struktury projektu...');
-    const cwd = process.cwd();
+    const cwd = getWorkingDir();
     const quickScan = await quickScanProject(cwd, 3);
     state.quickContext = buildQuickContext(quickScan);
     logger.info('CHAT', `Załadowano strukturę: ${quickScan.files.length} plików, ${quickScan.dirs.length} katalogów`);

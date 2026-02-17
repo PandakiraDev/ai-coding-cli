@@ -87,6 +87,8 @@ export async function handleCommand(input, state) {
       return { action: 'continue', context: snippetCode };
     case '/memory':
       await handleMemoryCommand(subCmd, args);
+      // Odśwież kontekst pamięci w state po zmianach
+      state.memoryContext = buildMemoryContext(process.cwd()) || null;
       return { action: 'continue' };
     case '/test':
       await handleTestCommand(fullArgs);

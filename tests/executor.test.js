@@ -286,7 +286,7 @@ describe('executor', () => {
       expect(feedback).toContain('Katalog roboczy');
     });
 
-    it('should format error results with classification and diagnostics', () => {
+    it('should format error results with STOP signal, classification and diagnostics', () => {
       const results = [{
         command: 'Get-Content missing.txt',
         success: false,
@@ -295,10 +295,24 @@ describe('executor', () => {
         error: 'Proces zakończony z kodem 1',
       }];
       const feedback = formatResultsForFeedback(results);
+      expect(feedback).toContain('STOP');
+      expect(feedback).toContain('PRZERWIJ AKTUALNY PLAN');
       expect(feedback).toContain('BŁĄD');
       expect(feedback).toContain('PATH_NOT_FOUND');
       expect(feedback).toContain('Diagnostyka');
       expect(feedback).toContain('NIE powtarzaj');
+    });
+
+    it('should NOT include STOP signal for successful results', () => {
+      const results = [{
+        command: 'Get-Process',
+        success: true,
+        stdout: 'ok',
+        stderr: '',
+      }];
+      const feedback = formatResultsForFeedback(results);
+      expect(feedback).not.toContain('STOP');
+      expect(feedback).toContain('SUKCES');
     });
   });
 
